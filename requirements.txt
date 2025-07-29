@@ -4,3 +4,4 @@ duckdb
 pandas
 pyarrow
 python-multipart
+requests

@@ -163,5 +163,7 @@ cython_debug/
 #.idea/
 
 # RBS: Ignore cache
-cache/*
-data/*
+cache/**
+data/**
+gpu_server/data/**
+gpu_server/jobs/**
