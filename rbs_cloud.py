@@ -1,6 +1,7 @@
 import os
 import shutil
 from typing import List, Optional
+from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -85,14 +86,19 @@ def process_uploaded_files(params: ProcessParams):
         "params_received": params.dict()
     }
 
+
 @app.get("/list")
-def list_files():
-    files = [f for f in os.listdir(DIR_DATA)]
+def list_all_files(name: str = ""):
+    if len(name) == 0:
+        files = []
+    else:
+        root = Path(DIR_DATA) / name
+        files = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
     return {"files": files}
 
 @app.get("/download")
 def download_file(filename: str = Query(...)):
-    file_path = os.path.join(DIR_DATA, filename)
-    if not os.path.isfile(file_path):
+    file_path = Path(DIR_DATA) / filename
+    if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Файл не найден")
-    return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
+    return FileResponse(file_path, filename=file_path.name, media_type="application/octet-stream")
