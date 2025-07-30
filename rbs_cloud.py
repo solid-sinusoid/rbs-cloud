@@ -42,7 +42,7 @@ if not os.path.exists(ID_FILE):
 if not os.path.exists(DATASET_FILE):
     # Опишем схему
     schema = pa.schema([
-        ("id", pa.int32()),
+        # ("id", pa.int32()),
         ("name", pa.string()),
         ("num_episodes", pa.int32()),
         ("src_format", pa.string()),
@@ -56,17 +56,86 @@ if not os.path.exists(DATASET_FILE):
 
 if not os.path.exists(WEIGHTS_FILE):
     schema = pa.schema([
-        ("id", pa.int32()),
+        # ("id", pa.int32()),
         ("name", pa.string()),
-        ("ref_up_ds", pa.int32()),
+        ("dataset", pa.string()),
         ("steps", pa.int32())
     ])
     table = pa.Table.from_pandas(pd.DataFrame(columns=schema.names), schema=schema)
     pq.write_table(table, WEIGHTS_FILE)
 
+# def get_cid(con, name: str = 'datasets') -> int:
+#     try:
+#         # Выполняем SQL-запрос для получения cid
+#         query = f"""
+#             SELECT cid
+#             FROM '{ID_FILE}'
+#             WHERE name = '{name}'
+#         """
+#         result = con.execute(query).fetchone()  # Получаем первую запись
+
+#         # Проверяем, найдена ли запись
+#         if result is not None:
+#             return result[0]  # Возвращаем значение cid
+#         else:
+#             raise ValueError(f"Запись с name='{name}' не найдена.")
+#     except Exception as e:
+#         print(f"Ошибка при получении cid: {e}")
+#         return None
+
 @app.get("/")
 def root():
     return {"message": "Rbs Cloud (DuckDB Parquet API) работает!"}
+
+@app.post("/create-dataset/")
+async def create_dataset(dataset_name: str):
+    ds_path = Path(DIR_DATA) / dataset_name
+    # Проверим на повтор
+    if ds_path.exists():
+        raise HTTPException(status_code=500, detail=f"Repeat name '{dataset_name}'")
+
+    # Открываем соединение с DuckDB
+    con = duckdb.connect()
+
+    try:
+        # Начинаем транзакцию
+        con.execute("BEGIN;")
+
+        new_d = {
+            # "id": cid,
+            "name": dataset_name,
+            "num_episodes": 0,
+            "src_format": "rosbag",
+            "work_format": "lerobot",
+            "status": DatasetStatus.CREATING
+        }
+        # Добавляем новую запись в DATASET_FILE
+        new_df = pd.DataFrame([new_d])
+
+        # Читаем существующий файл, если он существует
+        try:
+            existing_df = pd.read_parquet(DATASET_FILE)
+            # Объединяем существующий DataFrame с новым
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        except FileNotFoundError:
+            # Если файл не существует, просто используем новый DataFrame
+            combined_df = new_df
+
+        # Сохраняем объединенный DataFrame обратно в файл
+        combined_df.to_parquet(DATASET_FILE, index=False, engine='pyarrow')
+
+        # Завершаем транзакцию
+        con.execute("COMMIT;")
+        # Создадим папку датасета
+        ds_path.mkdir()
+    except Exception as e:
+        # В случае ошибки откатываем транзакцию
+        con.execute("ROLLBACK;")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+    return {"message": f"Dataset '{dataset_name}' added successfully"}
 
 @app.post("/update-dataset/")
 async def update_dataset(new_record: dict, update_id: int):
