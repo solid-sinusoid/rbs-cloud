@@ -1,8 +1,9 @@
 import requests
+import argparse
 from pathlib import Path
 
 # === Конфигурация ===
-FOLDER_PATH = "/home/shalenikol/0/rbs_dataset_46ep_blue+black/rbs_bag/episode10/"
+FOLDER_PATH = "/home/shalenikol/0/rbs_dataset_2025-06-03_aubo_sim/rbs_bag/"
 UPLOAD_URL = "http://localhost:8000/upload"
 PROCESS_URL = "http://localhost:8000/process"
 
@@ -13,19 +14,22 @@ PROCESS_PARAMS = {
     "mode": "rosbag"
 }
 
-def upload_parquet_files(folder_path):
-    folder = Path(folder_path)
-    files = list(folder.glob("*.*"))
+def upload_files(folder_path, ds_name):
+    # folder = Path(folder_path)
+    # files = list(folder.glob("*.*"))
+    root = Path(folder_path)
+    files = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
 
     if not files:
         print("❗️Нет файлов в указанной папке.")
         return False
 
-    for file_path in files:
-        print(f"📤 Загружается: {file_path.name} ...")
+    for rel_path in files:
+        print(f"📤 Загружается: {rel_path} ...")
+        file_path = root / rel_path
         with open(file_path, "rb") as f:
-            files = {"file": (file_path.name, f, "application/octet-stream")}
-            response = requests.post(UPLOAD_URL, files=files)
+            files = {"file": (rel_path, f, "application/octet-stream")}
+            response = requests.post(UPLOAD_URL, files=files, json={"dataset_name": ds_name})
 
         if response.ok:
             print("✅ Успешно:", response.json())
@@ -49,6 +53,11 @@ def trigger_processing(params):
 
 
 if __name__ == "__main__":
-    success = upload_parquet_files(FOLDER_PATH)
+    parser = argparse.ArgumentParser(description="Send dataset to the server.")
+    parser.add_argument("--dataset", type=str, default="your_ds_name", help="Имя датасета (уникальное)")
+
+    args = parser.parse_args()
+
+    success = upload_files(FOLDER_PATH, args.dataset)
     if success:
         trigger_processing(PROCESS_PARAMS)

@@ -9,8 +9,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel
-from fastapi import FastAPI, Query, HTTPException, File, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Query, HTTPException, File, UploadFile, Form
+from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI()
 
@@ -19,25 +19,15 @@ DIR_DATA = "data"
 # Папка кэша
 DIR_CACHE = "cache"
 # Пути к parquet-файлам
-ID_FILE = DIR_DATA + "/file_ids.parquet"
 DATASET_FILE = DIR_DATA + "/datasets.parquet"
 WEIGHTS_FILE = DIR_DATA + "/weights.parquet"
 
 class DatasetStatus(str, Enum):
     CREATING = "creating"
+    SAVE = "save"
     CONVERSION = "conversion"
     STORE = "store"
     AT_WORK = "at work" # is weights
-
-# Проверка наличия файла при старте
-if not os.path.exists(ID_FILE):
-    # create id_file
-    df = pd.DataFrame({
-        "name": ["RBS_ID", "datasets", "weights"],
-        "cid": [0, 0, 0],
-        "sign": ["", "", ""]
-    })
-    df.to_parquet(ID_FILE, index=False)
 
 if not os.path.exists(DATASET_FILE):
     # Опишем схему
@@ -54,6 +44,10 @@ if not os.path.exists(DATASET_FILE):
     # Сохраняем таблицу в файл .parquet
     pq.write_table(table, DATASET_FILE)
 
+@app.post("/save-dataset/")
+async def save_dataset(dataset_name: str):
+    pass
+
 if not os.path.exists(WEIGHTS_FILE):
     schema = pa.schema([
         # ("id", pa.int32()),
@@ -64,28 +58,13 @@ if not os.path.exists(WEIGHTS_FILE):
     table = pa.Table.from_pandas(pd.DataFrame(columns=schema.names), schema=schema)
     pq.write_table(table, WEIGHTS_FILE)
 
-# def get_cid(con, name: str = 'datasets') -> int:
-#     try:
-#         # Выполняем SQL-запрос для получения cid
-#         query = f"""
-#             SELECT cid
-#             FROM '{ID_FILE}'
-#             WHERE name = '{name}'
-#         """
-#         result = con.execute(query).fetchone()  # Получаем первую запись
-
-#         # Проверяем, найдена ли запись
-#         if result is not None:
-#             return result[0]  # Возвращаем значение cid
-#         else:
-#             raise ValueError(f"Запись с name='{name}' не найдена.")
-#     except Exception as e:
-#         print(f"Ошибка при получении cid: {e}")
-#         return None
-
 @app.get("/")
 def root():
     return {"message": "Rbs Cloud (DuckDB Parquet API) работает!"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.post("/create-dataset/")
 async def create_dataset(dataset_name: str):
@@ -137,36 +116,76 @@ async def create_dataset(dataset_name: str):
 
     return {"message": f"Dataset '{dataset_name}' added successfully"}
 
-@app.post("/update-dataset/")
-async def update_dataset(new_record: dict, update_id: int):
-    # Открываем соединение с DuckDB
-    con = duckdb.connect()
+def safe_relative_path(rel_path: str) -> Path:
+    """
+    Проверка и нормализация относительного пути: запрещаем выход за пределы через '..'
+    """
+    p = Path(rel_path)
+    if any(part == ".." for part in p.parts):
+        raise ValueError("Относительный путь содержит запрещённые сегменты '..'")
+    return p
+
+def get_dataset_info(name: str) -> dict:
+    df = duckdb.query(f"SELECT * FROM '{DATASET_FILE}' WHERE name = '{name}'").to_df()
+    return df.to_dict(orient="records")
+
+@app.post("/upload-rel")
+async def upload_rel(
+    dataset_name: str = Form(...),
+    relative_path: str = Form(...),
+    file: UploadFile = File(...)
+):
+    ds_info = get_dataset_info(dataset_name)
+    if not ds_info:
+        raise HTTPException(status_code=404, detail=f"Датасет '{dataset_name}' не создан")
+    if not ds_info[0]["status"] == DatasetStatus.CREATING:
+        raise HTTPException(status_code=405, detail=f"Датасет '{dataset_name}' уже сохранён")
+
+    print(f"{ds_info=}")
+    try:
+        relp = safe_relative_path(relative_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    dataset_path = Path(DIR_CACHE) / dataset_name
+    dest_path = dataset_path / relp
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Начинаем транзакцию
-        con.execute("BEGIN;")
-
-        # Добавляем новую запись в DATASET_FILE
-        new_df = pd.DataFrame([new_record])
-        new_df.to_parquet(DATASET_FILE, index=False, engine='pyarrow', append=True)
-
-        # Обновляем существующую запись в ID_FILE
-        con.execute(f"""
-            UPDATE '{ID_FILE}'
-            SET cid = cid + 1
-            WHERE name = 'RBS_ID';
-        """)
-
-        # Завершаем транзакцию
-        con.execute("COMMIT;")
+        # Сохраняем файл
+        with open(dest_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
     except Exception as e:
-        # В случае ошибки откатываем транзакцию
-        con.execute("ROLLBACK;")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        con.close()
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла: {e}")
 
-    return {"message": "Запись успешно добавлена и обновлена."}
+    return JSONResponse({"status": "ok", "saved_to": str(dest_path)})
+
+# # dataset весь целиком
+# @app.post("/upload-dataset")
+# async def upload_dataset(
+#     dataset_name: str = Form(...),
+#     files: List[UploadFile] = File(...)
+# ):
+#     dataset_path = Path(DIR_CACHE) / dataset_name
+
+#     try:
+#         for file in files:
+#             # Восстановление относительного пути
+#             relative_path = Path(file.filename)
+#             dest_path = dataset_path / relative_path
+
+#             # Создание всех промежуточных директорий
+#             dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+#             # Сохранение файла
+#             with open(dest_path, "wb") as f:
+#                 f.write(await file.read())
+
+#         return {"status": "success", "message": f"Dataset '{dataset_name}' uploaded."}
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to upload: {e}")
 
 @app.get("/preview")
 def preview(file:str = "file_ids", limit: int = 10):
@@ -188,12 +207,11 @@ def run_query(sql: str = Query(..., description="SQL-запрос к parquet-ф�
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+class UploadParams(BaseModel):
+    dataset_name: Optional[str] = "new_ds"
 
 @app.post("/upload")
-def upload_parquet(file: UploadFile = File(...)):
-    # if not file.filename.endswith(".parquet"):
-    #     raise HTTPException(status_code=400, detail="Можно загружать только .parquet файлы.")
-    
+def upload(file: UploadFile = File(...)):
     save_path = os.path.join(DIR_CACHE, file.filename)
     try:
         with open(save_path, "wb") as buffer:
