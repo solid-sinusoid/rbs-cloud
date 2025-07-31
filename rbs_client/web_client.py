@@ -10,6 +10,11 @@ from pathlib import Path
 import requests
 import streamlit as st
 from rbs_client.upload_dataset import upload_dataset_to_server
+from rbs_client.web_utils import (
+    _safe_rerun,
+    upload_directory,
+    fetch_preview,
+)
 
 API_URL = "http://msi.lan:8000"  # меняйте при необходимости
 
@@ -18,60 +23,7 @@ API_URL = "http://msi.lan:8000"  # меняйте при необходимос�
 # -----------------------------------------------------------------------------
 
 
-def _safe_rerun():
-    if hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
-    elif hasattr(st, "rerun"):
-        st.rerun()
 
-
-def upload_file(path: Path):
-    with path.open("rb") as fh:
-        files = {"file": (path.name, fh, "application/octet-stream")}
-        requests.post(f"{API_URL}/upload", files=files).raise_for_status()
-
-
-def upload_directory(dir_path: Path):
-    file_list = [p for p in dir_path.rglob("*") if p.is_file()]
-    total = len(file_list)
-    if total == 0:
-        st.warning("Папка пуста")
-        return 0, 0
-
-    prog = st.progress(0.0, text="Загрузка файлов…")
-    ok = err = 0
-    for idx, file in enumerate(file_list, 1):
-        try:
-            upload_file(file)
-            ok += 1
-        except Exception as exc:
-            st.warning(f"{file.name}: {exc}")
-            err += 1
-        prog.progress(idx / total, text=f"{idx}/{total} загружено…")
-    prog.empty()
-    return ok, err
-
-
-def fetch_preview(file: str, limit: int):
-    """Возвращает данные /preview в виде списка dict либо None при ошибке."""
-    try:
-        resp = requests.get(f"{API_URL}/preview",
-                            params={"file": file, "limit": limit})
-        resp.raise_for_status()
-        return resp.json()          # ← главное изменение
-    except Exception as exc:
-        st.error(f"Ошибка /preview {file}: {exc}")
-        return None
-
-
-def list_uploaded():
-    try:
-        resp = requests.get(f"{API_URL}/list", params={"name": ""})
-        resp.raise_for_status()
-        return resp.json().get("files", [])
-    except Exception as exc:
-        st.error(f"Ошибка /list: {exc}")
-        return []
 
 
 # -----------------------------------------------------------------------------
@@ -104,18 +56,23 @@ def main():
         dataset_name = st.text_input(
             "Имя датасета на сервере", placeholder="dataset_name"
         )
-        if dir_path_str and Path(dir_path_str).is_dir():
-            if st.button("Загрузить все файлы"):
-                with st.spinner("Отправляем файлы…"):
-                    ok, err = upload_directory(Path(dir_path_str))
-                st.success(f"Успешно: {ok}, ошибок: {err}")
-                _safe_rerun()
-            if dataset_name and st.button("Загрузить датасет на сервер"):
+        if st.button("Загрузить датасет на сервер"):
+            if not dir_path_str or not Path(dir_path_str).is_dir():
+                st.warning("Путь не существует или не директория")
+            elif not dataset_name:
+                st.warning("Укажите имя датасета")
+            else:
                 with st.spinner("Загрузка датасета…"):
                     upload_dataset_to_server(dataset_name, dir_path_str, API_URL)
                 st.success(f"Датасет '{dataset_name}' загружен")
                 _safe_rerun()
-        elif dir_path_str:
+
+        if dir_path_str and Path(dir_path_str).is_dir() and st.button("Загрузить все файлы"):
+            with st.spinner("Отправляем файлы…"):
+                ok, err = upload_directory(Path(dir_path_str))
+            st.success(f"Успешно: {ok}, ошибок: {err}")
+            _safe_rerun()
+        elif dir_path_str and not Path(dir_path_str).is_dir():
             st.warning("Путь не существует или не директория")
 
         st.divider()
