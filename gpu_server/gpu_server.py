@@ -7,7 +7,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ─────────────────── Константы центрального сервера ───────────────────
-DATA_SERVER   = "http://localhost:8000"
+DATA_SERVER   = "http://msi.lan:8000"
 LIST_URL      = f"{DATA_SERVER}/list"      # GET  → {"files": ["rbs_ros2bag", ...]}
 DOWNLOAD_URL  = f"{DATA_SERVER}/download"  # GET  dataset_name+".zip"
 UPLOAD_URL    = f"{DATA_SERVER}/upload"    # POST multipart/form-data
