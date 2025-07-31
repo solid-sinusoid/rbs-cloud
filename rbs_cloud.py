@@ -9,6 +9,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel
+import requests
 from fastapi import FastAPI, Query, HTTPException, File, UploadFile
 from fastapi.responses import FileResponse
 
@@ -18,6 +19,8 @@ app = FastAPI()
 DIR_DATA = "data"
 # Папка кэша
 DIR_CACHE = "cache"
+# URL GPU-сервера для обучения
+GPU_SERVER = os.environ.get("GPU_SERVER", "http://localhost:8001")
 # Пути к parquet-файлам
 ID_FILE = DIR_DATA + "/file_ids.parquet"
 DATASET_FILE = DIR_DATA + "/datasets.parquet"
@@ -190,36 +193,71 @@ def run_query(sql: str = Query(..., description="SQL-запрос к parquet-ф�
 
 
 @app.post("/upload")
-def upload_parquet(file: UploadFile = File(...)):
-    # if not file.filename.endswith(".parquet"):
-    #     raise HTTPException(status_code=400, detail="Можно загружать только .parquet файлы.")
-    
-    save_path = os.path.join(DIR_CACHE, file.filename)
+def upload_parquet(
+    file: UploadFile = File(...),
+    dataset: str | None = None,
+    steps: int | None = None,
+):
+    """Сохранение файла. Если указан dataset, файл кладётся в data/<dataset>."""
+    if dataset:
+        save_dir = Path(DIR_DATA) / dataset
+    else:
+        save_dir = Path(DIR_CACHE)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / file.filename
+
     try:
         with open(save_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        return {"message": f"Файл '{file.filename}' успешно сохранён в {DIR_CACHE}/."}
+        if dataset and dataset.startswith("weights/"):
+            ds_name = dataset.split("/", 1)[1]
+            try:
+                df = pd.read_parquet(WEIGHTS_FILE)
+            except Exception:
+                df = pd.DataFrame()
+            new_row = {
+                "name": file.filename,
+                "dataset": ds_name,
+                "steps": steps or 0,
+            }
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            df.to_parquet(WEIGHTS_FILE, index=False)
+        return {"message": f"Файл '{file.filename}' сохранён в {save_dir}/"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 class ProcessParams(BaseModel):
+    dataset_name: str
     episode: Optional[int] = None
-    # columns: Optional[List[str]] = None
     mode: Optional[str] = "convert"
 
 @app.post("/process")
 def process_uploaded_files(params: ProcessParams):
-    # parquet_files = [f for f in os.listdir("data") if f.endswith(".parquet")]
-    # if not parquet_files:
-    #     raise HTTPException(status_code=404, detail="Нет загруженных файлов для обработки.")
+    """Простейшая конвертация файлов из rosbag в lerobot (заглушка)."""
+    ds_dir = Path(DIR_DATA) / params.dataset_name
+    if not ds_dir.exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # Вывод параметров
-    return {
-        # "message": f"Обработка {len(parquet_files)} файлов запущена.",
-        # "files": parquet_files,
-        "params_received": params.dict()
-    }
+    conv_dir = ds_dir / "converted"
+    conv_dir.mkdir(exist_ok=True)
+    bags = list(ds_dir.glob("*.bag"))
+    for bag in bags:
+        target = conv_dir / (bag.stem + ".lrb")
+        shutil.copy(bag, target)
+
+    # обновляем информацию о датасете
+    try:
+        df = pd.read_parquet(DATASET_FILE)
+        idx = df.index[df["name"] == params.dataset_name]
+        if len(idx) > 0:
+            df.loc[idx, "num_episodes"] = len(bags)
+            df.loc[idx, "status"] = DatasetStatus.STORE
+            df.to_parquet(DATASET_FILE, index=False)
+    except Exception:
+        pass
+
+    return {"message": f"Converted {len(bags)} files"}
 
 
 @app.get("/list")
@@ -237,3 +275,28 @@ def download_file(filename: str = Query(...)):
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Файл не найден")
     return FileResponse(file_path, filename=file_path.name, media_type="application/octet-stream")
+
+
+@app.post("/train")
+def start_training(dataset_name: str, steps: int = 100_000):
+    """Проксирование запроса на GPU‑сервер."""
+    try:
+        resp = requests.post(
+            f"{GPU_SERVER}/train",
+            json={"dataset_name": dataset_name, "steps": steps},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/train-status/{job_id}")
+def train_status(job_id: str):
+    try:
+        resp = requests.get(f"{GPU_SERVER}/status/{job_id}", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

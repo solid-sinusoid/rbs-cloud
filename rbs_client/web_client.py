@@ -26,10 +26,14 @@ def _safe_rerun():
         st.rerun()
 
 
-def upload_file(path: Path):
+def upload_file(path: Path, dataset: str):
     with path.open("rb") as fh:
         files = {"file": (path.name, fh, "application/octet-stream")}
-        requests.post(f"{API_URL}/upload", files=files).raise_for_status()
+        requests.post(
+            f"{API_URL}/upload",
+            params={"dataset": dataset},
+            files=files,
+        ).raise_for_status()
 
 
 def upload_directory(dir_path: Path):
@@ -41,9 +45,10 @@ def upload_directory(dir_path: Path):
 
     prog = st.progress(0.0, text="Загрузка файлов…")
     ok = err = 0
+    dataset = dir_path.name
     for idx, file in enumerate(file_list, 1):
         try:
-            upload_file(file)
+            upload_file(file, dataset)
             ok += 1
         except Exception as exc:
             st.warning(f"{file.name}: {exc}")
@@ -104,8 +109,11 @@ def main():
         )
         if dir_path_str and Path(dir_path_str).is_dir():
             if st.button("Загрузить все файлы"):
+                ds_name = Path(dir_path_str).name
+                requests.post(f"{API_URL}/create-dataset/", params={"dataset_name": ds_name}).raise_for_status()
                 with st.spinner("Отправляем файлы…"):
                     ok, err = upload_directory(Path(dir_path_str))
+                requests.post(f"{API_URL}/process", json={"dataset_name": ds_name}).raise_for_status()
                 st.success(f"Успешно: {ok}, ошибок: {err}")
                 _safe_rerun()
         elif dir_path_str:
@@ -117,10 +125,13 @@ def main():
         if files and st.button("Загрузить выбранные"):
             ok = err = 0
             with st.spinner("Передаём…"):
+                ds_name = "uploaded_files"
+                requests.post(f"{API_URL}/create-dataset/", params={"dataset_name": ds_name}).raise_for_status()
                 for f in files:
                     try:
                         requests.post(
                             f"{API_URL}/upload",
+                            params={"dataset": ds_name},
                             files={
                                 "file": (
                                     f.name,
@@ -133,6 +144,7 @@ def main():
                     except Exception as exc:
                         st.warning(f"{f.name}: {exc}")
                         err += 1
+                requests.post(f"{API_URL}/process", json={"dataset_name": ds_name}).raise_for_status()
             st.success(f"Успешно: {ok}, ошибок: {err}")
             _safe_rerun()
 
@@ -144,6 +156,19 @@ def main():
         preview_ds = fetch_preview("datasets", 10)
         if preview_ds:
             st.dataframe(preview_ds, use_container_width=True)
+            ds_names = [d["name"] for d in preview_ds]
+            sel_ds = st.selectbox("Датасет для обучения", ds_names)
+            steps = st.number_input("Шагов", value=100000, step=1000)
+            if st.button("Запустить обучение"):
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/train",
+                        params={"dataset_name": sel_ds, "steps": int(steps)},
+                    )
+                    resp.raise_for_status()
+                    st.write(resp.json())
+                except Exception as exc:
+                    st.error(f"Ошибка запуска обучения: {exc}")
         else:
             st.info("Список датасетов пуст")
 

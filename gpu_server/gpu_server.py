@@ -63,13 +63,18 @@ def download_dataset(relative_path: Path):
     except Exception as e:
         print(f"❌ Ошибка загрузки {relative_path}: {str(e)}")
 
-def upload_weights(job_id: str, output_dir: Path):
+def upload_weights(job_id: str, output_dir: Path, dataset: str, steps: int):
     """Архивируем output_dir и отсылаем на центральный сервер."""
     tar_path = output_dir.with_suffix(".tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(output_dir, arcname=".")
     with open(tar_path, "rb") as f:
-        r = requests.post(UPLOAD_URL, files={"file": (tar_path.name, f)}, timeout=30)
+        r = requests.post(
+            UPLOAD_URL,
+            params={"dataset": f"weights/{dataset}", "steps": steps},
+            files={"file": (tar_path.name, f)},
+            timeout=30,
+        )
         r.raise_for_status()                # 4xx/5xx => исключение
     tar_path.unlink()                       # убираем архив
 
@@ -135,7 +140,7 @@ async def run_training(files: list[Path], job_id: str, req: TrainRequest):
         # 5. Выгрузка весов ⟶ NAS
         _update_job(job_id, message="Загружаем веса на NAS…", progress=100.0)
         write_log("Uploading weights to NAS")
-        upload_weights(job_id, output_dir)
+        upload_weights(job_id, output_dir, req.dataset_name, req.steps)
 
         # 6. Очистка
         shutil.rmtree(local_ds,  ignore_errors=True)

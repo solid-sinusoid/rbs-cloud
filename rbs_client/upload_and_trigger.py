@@ -7,10 +7,12 @@ UPLOAD_URL = "http://localhost:8000/upload"
 PROCESS_URL = "http://localhost:8000/process"
 
 # === Параметры обработки ===
+DATASET_NAME = Path(FOLDER_PATH).name
+
 PROCESS_PARAMS = {
+    "dataset_name": DATASET_NAME,
     "episode": 10,
-    # "columns": ["id", "value"],
-    "mode": "rosbag"
+    "mode": "rosbag",
 }
 
 def upload_parquet_files(folder_path):
@@ -25,7 +27,9 @@ def upload_parquet_files(folder_path):
         print(f"📤 Загружается: {file_path.name} ...")
         with open(file_path, "rb") as f:
             files = {"file": (file_path.name, f, "application/octet-stream")}
-            response = requests.post(UPLOAD_URL, files=files)
+            response = requests.post(
+                UPLOAD_URL, params={"dataset": DATASET_NAME}, files=files
+            )
 
         if response.ok:
             print("✅ Успешно:", response.json())
