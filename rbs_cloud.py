@@ -46,7 +46,26 @@ if not os.path.exists(DATASET_FILE):
 
 @app.post("/save-dataset/")
 async def save_dataset(dataset_name: str):
-    pass
+    """Finalize dataset creation by updating its status."""
+    ds_path = Path(DIR_DATA) / dataset_name
+
+    if not ds_path.exists():
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' not created")
+
+    # Обновляем статус датасета
+    try:
+        df = pd.read_parquet(DATASET_FILE)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    mask = df["name"] == dataset_name
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' metadata not found")
+
+    df.loc[mask, "status"] = DatasetStatus.SAVE
+    df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+
+    return {"message": f"Dataset '{dataset_name}' saved"}
 
 if not os.path.exists(WEIGHTS_FILE):
     schema = pa.schema([
