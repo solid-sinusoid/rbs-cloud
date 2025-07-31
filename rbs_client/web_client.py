@@ -6,11 +6,10 @@ web_client.py — Streamlit‑клиент без зависимостей от 
 
 from io import BytesIO
 from pathlib import Path
-import json
 
-from fastapi.openapi.models import APIKey
 import requests
 import streamlit as st
+from rbs_client.upload_dataset import upload_dataset_to_server
 
 API_URL = "http://msi.lan:8000"  # меняйте при необходимости
 
@@ -102,11 +101,19 @@ def main():
         dir_path_str = st.text_input(
             "Полный путь к папке", placeholder="/abs/path/to/dir"
         )
+        dataset_name = st.text_input(
+            "Имя датасета на сервере", placeholder="dataset_name"
+        )
         if dir_path_str and Path(dir_path_str).is_dir():
             if st.button("Загрузить все файлы"):
                 with st.spinner("Отправляем файлы…"):
                     ok, err = upload_directory(Path(dir_path_str))
                 st.success(f"Успешно: {ok}, ошибок: {err}")
+                _safe_rerun()
+            if dataset_name and st.button("Загрузить датасет на сервер"):
+                with st.spinner("Загрузка датасета…"):
+                    upload_dataset_to_server(dataset_name, dir_path_str, API_URL)
+                st.success(f"Датасет '{dataset_name}' загружен")
                 _safe_rerun()
         elif dir_path_str:
             st.warning("Путь не существует или не директория")
