@@ -1,4 +1,4 @@
-import asyncio, datetime as dt, os, shutil, subprocess, tarfile, uuid
+import asyncio, datetime as dt, os, shutil, subprocess, uuid
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
@@ -9,8 +9,8 @@ from pydantic import BaseModel, Field
 # ─────────────────── Константы центрального сервера ───────────────────
 DATA_SERVER   = "http://msi.lan:8000"
 LIST_URL      = f"{DATA_SERVER}/list"      # GET  → {"files": ["rbs_ros2bag", ...]}
-DOWNLOAD_URL  = f"{DATA_SERVER}/download"  # GET  dataset_name+".zip"
-UPLOAD_URL    = f"{DATA_SERVER}/upload"    # POST multipart/form-data
+DOWNLOAD_URL  = f"{DATA_SERVER}/download"  # GET dataset files
+UPLOAD_WEIGHTS_URL = f"{DATA_SERVER}/upload-weights"
 
 # ────────────────── Локальные директории GPU‑узла ─────────────────────
 DATA_DIR = Path("data")   # <datasets>/<dataset_name>/…
@@ -64,14 +64,21 @@ def download_dataset(relative_path: Path):
         print(f"❌ Ошибка загрузки {relative_path}: {str(e)}")
 
 def upload_weights(job_id: str, output_dir: Path):
-    """Архивируем output_dir и отсылаем на центральный сервер."""
-    tar_path = output_dir.with_suffix(".tar.gz")
-    with tarfile.open(tar_path, "w:gz") as tar:
-        tar.add(output_dir, arcname=".")
-    with open(tar_path, "rb") as f:
-        r = requests.post(UPLOAD_URL, files={"file": (tar_path.name, f)}, timeout=30)
-        r.raise_for_status()                # 4xx/5xx => исключение
-    tar_path.unlink()                       # убираем архив
+    """Отправляем содержимое *output_dir* на центральный сервер без архивации."""
+    for file_path in output_dir.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel_path = file_path.relative_to(output_dir).as_posix()
+        with open(file_path, "rb") as f:
+            files = {"file": (file_path.name, f, "application/octet-stream")}
+            data = {"weights_name": job_id, "relative_path": rel_path}
+            r = requests.post(
+                UPLOAD_WEIGHTS_URL,
+                data=data,
+                files=files,
+                timeout=30,
+            )
+            r.raise_for_status()
 
 async def run_training(files: list[Path], job_id: str, req: TrainRequest):
     job_root   = JOBS_DIR / job_id

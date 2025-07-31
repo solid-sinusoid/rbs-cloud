@@ -180,6 +180,32 @@ async def upload_rel(
 
     return JSONResponse({"status": "ok", "saved_to": str(dest_path)})
 
+
+@app.post("/upload-weights")
+async def upload_weights(
+    weights_name: str = Form(...),
+    relative_path: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Загрузка весов (папка без архива)."""
+    try:
+        relp = safe_relative_path(relative_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    weights_root = Path(DIR_DATA) / "weights" / weights_name
+    dest_path = weights_root / relp
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with open(dest_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла: {e}")
+
+    return JSONResponse({"status": "ok", "saved_to": str(dest_path)})
+
 # # dataset весь целиком
 # @app.post("/upload-dataset")
 # async def upload_dataset(
