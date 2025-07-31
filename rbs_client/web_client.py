@@ -67,14 +67,6 @@ def main():
                 st.success(f"Датасет '{dataset_name}' загружен")
                 _safe_rerun()
 
-        if dir_path_str and Path(dir_path_str).is_dir() and st.button("Загрузить все файлы"):
-            with st.spinner("Отправляем файлы…"):
-                ok, err = upload_directory(Path(dir_path_str))
-            st.success(f"Успешно: {ok}, ошибок: {err}")
-            _safe_rerun()
-        elif dir_path_str and not Path(dir_path_str).is_dir():
-            st.warning("Путь не существует или не директория")
-
         st.divider()
         st.header("Или перетащите файлы")
         files = st.file_uploader("Выберите файлы", accept_multiple_files=True)
