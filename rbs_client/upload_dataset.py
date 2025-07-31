@@ -83,6 +83,17 @@ def upload_dataset_to_server(dataset_name: str, dataset_root: str, server_url: s
 
         print(f"\nЗагружено {success}/{len(files)} файлов.")
 
+        # Завершаем создание датасета
+        save_url = f"{server_url.rstrip('/')}/save-dataset/"
+        try:
+            resp = requests.post(save_url, params={"dataset_name": dataset_name}, timeout=10)
+            if resp.status_code == 200:
+                print("Датасет сохранён на сервере")
+            else:
+                print(f"Ошибка сохранения: {resp.status_code} {resp.text}")
+        except RequestException as e:
+            print(f"Ошибка при запросе save-dataset: {e}")
+
 # Пример запуска
 if __name__ == "__main__":
     upload_dataset_to_server(
