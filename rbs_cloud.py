@@ -1,6 +1,14 @@
 import os
 import shutil
-from typing import List, Optional
+import sys
+import subprocess
+import shlex
+import datetime
+import threading
+import time
+import errno
+import signal
+from typing import Optional
 from enum import Enum
 from pathlib import Path
 
@@ -44,29 +52,6 @@ if not os.path.exists(DATASET_FILE):
     # Сохраняем таблицу в файл .parquet
     pq.write_table(table, DATASET_FILE)
 
-@app.post("/save-dataset/")
-async def save_dataset(dataset_name: str):
-    """Finalize dataset creation by updating its status."""
-    ds_path = Path(DIR_DATA) / dataset_name
-
-    if not ds_path.exists():
-        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' not created")
-
-    # Обновляем статус датасета
-    try:
-        df = pd.read_parquet(DATASET_FILE)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    mask = df["name"] == dataset_name
-    if not mask.any():
-        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' metadata not found")
-
-    df.loc[mask, "status"] = DatasetStatus.SAVE
-    df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
-
-    return {"message": f"Dataset '{dataset_name}' saved"}
-
 if not os.path.exists(WEIGHTS_FILE):
     schema = pa.schema([
         # ("id", pa.int32()),
@@ -76,6 +61,56 @@ if not os.path.exists(WEIGHTS_FILE):
     ])
     table = pa.Table.from_pandas(pd.DataFrame(columns=schema.names), schema=schema)
     pq.write_table(table, WEIGHTS_FILE)
+
+# Простой helper для проверки, жив ли процесс (работает на Unix/Windows)
+def is_process_alive(pid: int) -> bool:
+    try:
+        if pid <= 0:
+            return False
+        # На Unix: посылаем 0 сигнал
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno in (errno.ESRCH,):  # No such process
+            return False
+        if e.errno in (errno.EPERM,):  # Нет прав, но процесс есть
+            return True
+        return False
+    else:
+        return True
+
+def monitor_conversion(dataset_name: str, pid: int, log_file: Path, pid_file: Path, process: subprocess.Popen): #, dataset_mask_func):
+    """Ждёт завершения процесса и обновляет статус."""
+    try:
+        retcode = process.wait()
+        # Читаем текущий df, обновляем статус в зависимости от результата
+        try:
+            df = pd.read_parquet(DATASET_FILE)
+            mask = df["name"] == dataset_name #dataset_mask_func(df)
+            if not mask.any():
+                # Не нашли — странно, оставляем как есть
+                return
+            if retcode == 0:
+                df.loc[mask, "status"] = DatasetStatus.STORE
+            else:
+                df.loc[mask, "status"] = DatasetStatus.SAVE  # откатываем
+                with open(log_file, "ab") as lf:
+                    lf.write(f"\n[!] Conversion exited with code {retcode}\n".encode("utf-8"))
+            # Пишем обратно
+            df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+        except Exception as e:
+            with open(log_file, "ab") as lf:
+                lf.write(f"\n[!] Failed to update status after conversion: {e}\n".encode("utf-8"))
+    finally:
+        # Удаляем pid-файл, потому что конвертация завершена
+        try:
+            if pid_file.exists():
+                pid_file.unlink()
+        except Exception:
+            pass
+
+def get_dataset_info(name: str) -> dict:
+    df = duckdb.query(f"SELECT * FROM '{DATASET_FILE}' WHERE name = '{name}'").to_df()
+    return df.to_dict(orient="records")
 
 @app.get("/")
 def root():
@@ -87,9 +122,9 @@ def health():
 
 @app.post("/create-dataset/")
 async def create_dataset(dataset_name: str):
-    ds_path = Path(DIR_DATA) / dataset_name
     # Проверим на повтор
-    if ds_path.exists():
+    ds_info = get_dataset_info(dataset_name)
+    if ds_info:
         raise HTTPException(status_code=500, detail=f"Repeat name '{dataset_name}'")
 
     # Открываем соединение с DuckDB
@@ -124,8 +159,9 @@ async def create_dataset(dataset_name: str):
 
         # Завершаем транзакцию
         con.execute("COMMIT;")
-        # Создадим папку датасета
-        ds_path.mkdir()
+        # !!! Будет создана при конвертации в lerobot
+        # # Создадим папку датасета
+        # ds_path.mkdir()
     except Exception as e:
         # В случае ошибки откатываем транзакцию
         con.execute("ROLLBACK;")
@@ -135,6 +171,157 @@ async def create_dataset(dataset_name: str):
 
     return {"message": f"Dataset '{dataset_name}' added successfully"}
 
+def conversion_dataset(dataset_name:str):
+    # Дедупликация: если уже есть PID и процесс жив — отклоняем
+    log_dir = Path(DIR_CACHE)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    pid_file = log_dir / f"convert_{dataset_name}.pid"
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text().strip())
+            if is_process_alive(existing_pid):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Conversion already in progress for dataset '{dataset_name}' (pid={existing_pid})"
+                )
+            else:
+                # Старая запись мёртвая — очищаем
+                pid_file.unlink()
+        except ValueError:
+            # битый файл — удалим
+            try:
+                pid_file.unlink()
+            except Exception:
+                pass
+
+    # Установим статус на CONVERSION
+    try:
+        df = pd.read_parquet(DATASET_FILE)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    mask = df["name"] == dataset_name
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' metadata not found")
+
+    try:
+        df.loc[mask, "status"] = DatasetStatus.CONVERSION
+        df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update status metadata: {e}")
+
+    # Подготовка логов и запуск
+    # timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_file = log_dir / f"convert_{dataset_name}_{timestamp}.log"
+
+    script_path = Path("convert_rosbag_to_lerobot.py").resolve()
+    if not script_path.exists():
+        # откатываем статус
+        try:
+            df = pd.read_parquet(DATASET_FILE)
+            df.loc[df["name"] == dataset_name, "status"] = DatasetStatus.SAVE
+            df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Conversion script not found at {script_path}")
+
+    # Формируем аргументы
+    json_out = (Path(DIR_CACHE) / f"{dataset_name}_msg.json").resolve()
+    images_out = (Path(DIR_CACHE) / f"{dataset_name}_frames").resolve()
+    cmd = [
+        sys.executable,
+        str(script_path),
+        str(Path(DIR_CACHE) / dataset_name),
+        "--output", str(Path(DIR_DATA) / dataset_name),
+        "--json", str(json_out),
+        "--images", str(images_out),
+    ]
+
+    try:
+        with open(log_file, "wb") as lf:
+            process = subprocess.Popen(
+                cmd,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+        # Записываем PID
+        pid_file.write_text(str(process.pid))
+
+        # # Запускаем мониторящий поток
+        # def dataset_mask_func(df_inner):
+        #     return df_inner["name"] == dataset_name
+
+        monitor_thread = threading.Thread(
+            target=monitor_conversion,
+            args=(dataset_name, process.pid, log_file, pid_file, process), # dataset_mask_func),
+            daemon=True,
+            name=f"monitor_conv_{dataset_name}"
+        )
+        monitor_thread.start()
+
+    except Exception as e:
+        # Откат статуса
+        try:
+            df = pd.read_parquet(DATASET_FILE)
+            df.loc[df["name"] == dataset_name, "status"] = DatasetStatus.SAVE
+            df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to start conversion: {e}")
+
+    return {
+        "message": f"Dataset '{dataset_name}' conversion started in background",
+        "conversion_log": str(log_file),
+        "conversion_pid_file": str(pid_file),
+        "pid": process.pid,
+    }
+
+@app.post("/save-dataset/")
+async def save_dataset(dataset_name: str):
+    """Finalize dataset creation by updating its status."""
+    ds_path = Path(DIR_DATA) / dataset_name
+
+    # Проверим на наличие
+    ds_info = get_dataset_info(dataset_name)
+    if not ds_info:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' not created")
+    ds_status = ds_info[0]["status"]
+    if not ds_status == DatasetStatus.CREATING:
+        raise HTTPException(status_code=500, detail=f"Датасет '{dataset_name}' имеет статус '{ds_status}'")
+
+    # Обновляем статус датасета
+    try:
+        df = pd.read_parquet(DATASET_FILE)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    mask = df["name"] == dataset_name
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' metadata not found")
+
+    try:
+        df.loc[mask, "status"] = DatasetStatus.SAVE
+        df.to_parquet(DATASET_FILE, index=False, engine="pyarrow")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update status metadata: {e}")
+
+    return conversion_dataset(dataset_name)
+
+@app.post("/convert-dataset/")
+async def convert_dataset(dataset_name: str):
+    # Проверим на наличие
+    ds_info = get_dataset_info(dataset_name)
+    if not ds_info:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_name}' not created")
+    ds_status = ds_info[0]["status"]
+    if not ds_status == DatasetStatus.SAVE:
+        raise HTTPException(status_code=500, detail=f"Dataset '{dataset_name}' is '{ds_status}'")
+
+    return conversion_dataset(dataset_name)
+
 def safe_relative_path(rel_path: str) -> Path:
     """
     Проверка и нормализация относительного пути: запрещаем выход за пределы через '..'
@@ -143,10 +330,6 @@ def safe_relative_path(rel_path: str) -> Path:
     if any(part == ".." for part in p.parts):
         raise ValueError("Относительный путь содержит запрещённые сегменты '..'")
     return p
-
-def get_dataset_info(name: str) -> dict:
-    df = duckdb.query(f"SELECT * FROM '{DATASET_FILE}' WHERE name = '{name}'").to_df()
-    return df.to_dict(orient="records")
 
 @app.post("/upload-rel")
 async def upload_rel(
