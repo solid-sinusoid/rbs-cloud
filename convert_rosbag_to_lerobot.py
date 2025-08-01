@@ -23,6 +23,8 @@ from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 FPS = 30 # default
 REPO_ID = "rbs_ros2bag"
@@ -46,7 +48,7 @@ def find_folders_with_db3_files(directory: Path) -> List[Path]:
     # Сортируем список папок
     return sorted(subfolders)
 
-def to_lerobot_dataset(json_file: Path, output_root: str):
+def to_lerobot_dataset(json_file: Path, output_root: str, num_workers: int = 1):
     # === ЗАГРУЗКА ДАННЫХ ===
     with open(json_file, "r") as f:
         data = json.load(f)
@@ -94,19 +96,26 @@ def to_lerobot_dataset(json_file: Path, output_root: str):
         use_videos=USE_VIDEOS,
     )
 
+    def load_frame_data(frame):
+        frame_data = {
+            "observation.state": np.array(frame["joint_state"]["pos"], dtype=np.float32),
+            "action": np.array(frame["joint_state"]["pos"], dtype=np.float32),
+        }
+        for cam_idx, cam in enumerate(camera_keys):
+            image_path = Path(frame[cam])
+            image = Image.open(image_path).convert("RGB")
+            frame_data[cam_features[cam_idx]] = np.array(image)
+        return frame_data
+
     for episode in data["episodes"]:
-        # === КОНВЕРТАЦИЯ ФРЕЙМОВ ===
-        for frame in episode["frames"]:
-            frame_data = {
-                "observation.state": np.array(frame["joint_state"]["pos"], dtype=np.float32),
-                "action": np.array(frame["joint_state"]["pos"], dtype=np.float32),
-            }
+        frames = episode["frames"]
+        if num_workers > 1:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                frame_datas = list(executor.map(load_frame_data, frames))
+        else:
+            frame_datas = [load_frame_data(f) for f in frames]
 
-            for cam_idx, cam in enumerate(camera_keys):
-                image_path = Path(frame[cam])
-                image = Image.open(image_path).convert("RGB")
-                frame_data[cam_features[cam_idx]] = np.array(image)
-
+        for frame_data in frame_datas:
             dataset.add_frame(frame_data, "default_task")
 
         # === СОХРАНЕНИЕ ЭПИЗОДА ===
@@ -345,6 +354,7 @@ def main():
     parser.add_argument("--output", default="./converted_dataset", help="Directory to store dataset")
     parser.add_argument("--json", default="ros2bag_msg.json", help="Path to output JSON file")
     parser.add_argument("--images", default="frames", help="Directory to store extracted images")
+    parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of worker threads for image loading")
     args = parser.parse_args()
 
     bag = Path(args.bag)
@@ -367,7 +377,7 @@ def main():
 
     extract_rosbag_to_json(bag, out_json, synced, frames)
 
-    to_lerobot_dataset(synced, args.output)
+    to_lerobot_dataset(synced, args.output, num_workers=args.workers)
 
     end_time = time.time()  # время окончания
     execution_time = end_time - start_time
